@@ -1,4 +1,5 @@
 def parse_sensor_data(linea: str):
+    print(f"RAW: {linea}")
     linea = linea.strip()
 
     datos = {}
