@@ -7,6 +7,7 @@ from app.serial.rs485_reader import open_rs485
 from app.serial.parser import parse_sensor_data
 from app.scheduler.scheduler import revisar_horarios
 from app.version import __version__
+from app.command_dispatcher import enviar_comando
 
 print(__version__)
 INTERVALO_SCHEDULER = 5  # segundos
@@ -35,7 +36,7 @@ def main():
                 ahora = time.time()
 
                 if ahora - ultimo_scheduler >= INTERVALO_SCHEDULER:
-                    revisar_horarios(conn, lambda cmd: enviar_comando_rs485(ser, cmd))
+                    revisar_horarios(conn, enviar_comando)
                     ultimo_scheduler = ahora
 
                 linea = ser.readline().decode(errors="ignore").strip()
