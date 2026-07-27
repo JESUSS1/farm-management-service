@@ -13,3 +13,4 @@ DB_CONFIG = {
 
 RS485_PORT = os.getenv("RS485_PORT", "/dev/ttyUSB0")
 RS485_BAUDRATE = int(os.getenv("RS485_BAUDRATE", "9600"))
+RS485_ENABLED = os.getenv("RS485_ENABLED", "true").lower() == "true"
