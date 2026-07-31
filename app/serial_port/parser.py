@@ -1,5 +1,10 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 def parse_sensor_data(linea: str):
-    print(f"RAW: {linea}")
+    logger.debug("RAW: %s", linea)
     linea = linea.strip()
 
     datos = {}

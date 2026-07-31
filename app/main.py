@@ -1,72 +1,82 @@
-import time
-from serial.serialutil import SerialException
+import asyncio
+import logging
+import signal
 
-from app.config import RS485_ENABLED
-from app.database.db import get_connection
-from app.database.repository import save_sensor_reading
-from app.serial_port.rs485_reader import open_rs485
-from app.serial_port.parser import parse_sensor_data
-from app.scheduler.scheduler import revisar_horarios
+from app.config import LOG_LEVEL, RS485_ENABLED
+from app.core.engine import Engine
+from app.scheduler.scheduler import (
+    offline_check_loop,
+    registry_refresh_loop,
+    scheduler_loop,
+)
 from app.version import __version__
 
-print(__version__)
-INTERVALO_SCHEDULER = 5
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+async def main_async():
+    logger.info("farm-management-service v%s", __version__)
+    modo = "RS485 + WiFi" if RS485_ENABLED else "WiFi-only (test)"
+    logger.info("Modo: %s", modo)
+
+    engine = Engine()
+    stop_event = asyncio.Event()
+
+    def _signal_handler():
+        logger.info("Señal de parada recibida, cerrando...")
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
+            pass
+
+    await engine.start()
+
+    scheduler_task = asyncio.create_task(_scheduler_with_restart(engine))
+    registry_task = asyncio.create_task(registry_refresh_loop(engine))
+    offline_task = asyncio.create_task(offline_check_loop(engine))
+
+    await _wait_for_stop(stop_event)
+
+    scheduler_task.cancel()
+    registry_task.cancel()
+    offline_task.cancel()
+    await asyncio.gather(
+        scheduler_task, registry_task, offline_task, return_exceptions=True
+    )
+
+    try:
+        await asyncio.wait_for(engine.stop(), timeout=10)
+    except asyncio.TimeoutError:
+        logger.warning("Shutdown timeout forzado")
+    logger.info("Servicio detenido")
+
+
+async def _scheduler_with_restart(engine):
+    while True:
+        try:
+            await scheduler_loop(engine)
+        except Exception as e:
+            logger.error(
+                "Scheduler crashed, reiniciando en 5s: %s", e, exc_info=True
+            )
+            await asyncio.sleep(5)
+
+
+async def _wait_for_stop(stop_event: asyncio.Event):
+    await stop_event.wait()
+    logger.info("Deteniendo tareas...")
 
 
 def main():
-    conn = get_connection()
-
-    if RS485_ENABLED:
-        ser = open_rs485()
-        modo = "RS485 + WiFi"
-    else:
-        ser = None
-        modo = "WiFi-only (test)"
-
-    print(f"Sistema iniciado — modo: {modo}")
-    ultimo_scheduler = 0
-    time.sleep(2)
-
-    try:
-        while True:
-            ahora = time.time()
-
-            if ahora - ultimo_scheduler >= INTERVALO_SCHEDULER:
-                revisar_horarios(conn)
-                ultimo_scheduler = ahora
-
-            if ser is not None:
-                try:
-                    linea = ser.readline().decode(errors="ignore").strip()
-                except SerialException as e:
-                    print("Error serial:", e)
-                    print("Posible desconexión del RS485/ESP32")
-                    break
-
-                if not linea:
-                    time.sleep(0.2)
-                    continue
-
-                print("Dato recibido:", linea)
-                lectura = parse_sensor_data(linea)
-
-                if lectura is None:
-                    print("Dato ignorado")
-                    continue
-
-                save_sensor_reading(conn, lectura)
-                print("Guardado en DB")
-            else:
-                time.sleep(INTERVALO_SCHEDULER)
-
-    except KeyboardInterrupt:
-        print("\nPrograma detenido")
-
-    finally:
-        if ser is not None:
-            ser.close()
-        conn.close()
-        print("Puerto y base de datos cerrados")
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":

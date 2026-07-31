@@ -1,127 +1,137 @@
+import asyncio
+import logging
+
 from datetime import datetime
 
-from app.command_dispatcher import enviar_comando_wifi_por_ip, PUERTO_COMANDO
-from app.database.repository import (
-    crear_historial_inicio,
-    finalizar_historial,
-)
+from app.core.http_client import HttpClient
 
-ACCION_TO_COMANDO = {
-    "TURN_ON": "LED_ON",
-    "TURN_OFF": "LED_OFF",
-}
+logger = logging.getLogger(__name__)
+
+INTERVALO_SCHEDULER = 5
+INTERVALO_REGISTRY_REFRESH = 60
+TIMEOUT_OFFLINE = 5
+INTERVALO_OFFLINE = 60
 
 
-def revisar_horarios(conn):
+async def revisar_horarios(engine):
+    http: HttpClient = engine.http
     ahora = datetime.now()
     hora_str = ahora.strftime("%H:%M")
 
-    with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT
-                ht.horario_tarea_id,
-                ht.hora_inicio::TEXT,
-                ht.hora_fin::TEXT,
-                ai.codigo AS accion_inicio_codigo,
-                af.codigo AS accion_fin_codigo,
-                htd.horario_tarea_dispositivo_id,
-                d.dispositivo_id,
-                d.device_key,
-                d.ip_wifi::TEXT,
-                hist.historial_tarea_id,
-                hist.estado AS historial_estado
-            FROM horario_tarea ht
-            JOIN tarea t ON t.tarea_id = ht.tarea_id
-                AND t.estado = TRUE AND t.eliminado_at IS NULL
-            JOIN accion ai ON ai.accion_id = t.accion_inicio_id
-            LEFT JOIN accion af ON af.accion_id = t.accion_fin_id
-            JOIN horario_tarea_dispositivo htd ON htd.horario_tarea_id = ht.horario_tarea_id
-                AND htd.estado = TRUE AND htd.eliminado_at IS NULL
-            JOIN dispositivo d ON d.dispositivo_id = htd.dispositivo_id
-                AND d.estado = TRUE AND d.eliminado_at IS NULL
-            LEFT JOIN historial_tarea hist ON hist.horario_tarea_dispositivo_id = htd.horario_tarea_dispositivo_id
-                AND hist.estado = 'INICIADA' AND hist.eliminado_at IS NULL
-            WHERE ht.estado = TRUE AND ht.eliminado_at IS NULL
-              AND EXTRACT(ISODOW FROM CURRENT_TIMESTAMP) = ANY(ht.dias_semana)
-              AND (
-                  (TO_CHAR(ht.hora_inicio, 'HH24:MI') = %s)
-                  OR (ht.hora_fin IS NOT NULL AND TO_CHAR(ht.hora_fin, 'HH24:MI') = %s)
-              )
-            """,
-            (hora_str, hora_str),
-        )
+    rows = await http.get_pending_tasks(hora_str)
 
-        horarios = cursor.fetchall()
-
-    if not horarios:
+    if not rows:
         return
 
-    print(f"Horarios pendientes a las {hora_str}: {len(horarios)}")
+    logger.info("Horarios pendientes a las %s: %d", hora_str, len(rows))
 
-    with conn.cursor() as cursor:
-        for h in horarios:
-            horario_id = h["horario_tarea_id"]
-            htd_id = h["horario_tarea_dispositivo_id"]
-            device_key = h["device_key"]
-            ip_wifi = h["ip_wifi"]
+    for h in rows:
+        horario_id = h["horario_tarea_id"]
+        htd_id = h["horario_tarea_dispositivo_id"]
+        device_key = h["device_key"]
+        ip_wifi = h.get("ip_wifi")
 
-            inicio_str = h["hora_inicio"][:5] if h["hora_inicio"] else None
-            fin_str = h["hora_fin"][:5] if h["hora_fin"] else None
+        inicio_str = h["hora_inicio"][:5] if h.get("hora_inicio") else None
+        fin_str = h["hora_fin"][:5] if h.get("hora_fin") else None
 
-            # --- ACCIÓN DE INICIO ---
-            if inicio_str == hora_str and h["accion_inicio_codigo"]:
-                if h["historial_tarea_id"] is None:
-                    comando = ACCION_TO_COMANDO.get(h["accion_inicio_codigo"])
-                    if not comando:
-                        print(f"  Acción inicio desconocida: {h['accion_inicio_codigo']}")
-                        continue
-
-                    if ip_wifi:
-                        ip_limpia = ip_wifi.split("/")[0]
-                        ok = enviar_comando_wifi_por_ip(ip_limpia, PUERTO_COMANDO, comando)
-                        estado = "INICIADA" if ok else "ERROR_INICIO"
-                    else:
-                        print(f"  {device_key}: sin IP WiFi, omitiendo")
-                        estado = "ERROR_INICIO"
-
-                    crear_historial_inicio(conn, htd_id, estado)
-                    _actualizar_ultima_ejecucion(cursor, horario_id)
-                    print(f"  [INICIO] {device_key} -> {comando} ({estado})")
+        if inicio_str == hora_str and h.get("accion_inicio_codigo"):
+            if h.get("historial_tarea_id") is None:
+                if ip_wifi:
+                    ok = await engine.send_command(
+                        device_key, h["accion_inicio_codigo"]
+                    )
+                    estado = "INICIADA" if ok else "ERROR_INICIO"
                 else:
-                    print(f"  [SKIP] {device_key} ya tiene historial activo")
+                    logger.warning("%s: sin IP WiFi, omitiendo", device_key)
+                    estado = "ERROR_INICIO"
+                await http.create_task_history(htd_id, estado)
+                await http.update_schedule_last_execution(horario_id)
+                logger.info(
+                    "[INICIO] %s -> %s (%s)", device_key, h["accion_inicio_codigo"], estado
+                )
+            else:
+                logger.debug("[SKIP] %s ya tiene historial activo", device_key)
 
-            # --- ACCIÓN DE FIN ---
-            if fin_str == hora_str and h["accion_fin_codigo"]:
-                if h["historial_tarea_id"] is not None and h["historial_estado"] == "INICIADA":
-                    comando = ACCION_TO_COMANDO.get(h["accion_fin_codigo"])
-                    if not comando:
-                        print(f"  Acción fin desconocida: {h['accion_fin_codigo']}")
-                        continue
-
-                    if ip_wifi:
-                        ip_limpia = ip_wifi.split("/")[0]
-                        ok = enviar_comando_wifi_por_ip(ip_limpia, PUERTO_COMANDO, comando)
-                        estado = "FINALIZADA" if ok else "ERROR_FINALIZACION"
-                    else:
-                        print(f"  {device_key}: sin IP WiFi, omitiendo")
-                        estado = "ERROR_FINALIZACION"
-
-                    finalizar_historial(conn, htd_id, estado)
-                    _actualizar_ultima_ejecucion(cursor, horario_id)
-                    print(f"  [FIN] {device_key} -> {comando} ({estado})")
+        if fin_str == hora_str and h.get("accion_fin_codigo"):
+            if (
+                h.get("historial_tarea_id") is not None
+                and h.get("historial_estado") == "INICIADA"
+            ):
+                if ip_wifi:
+                    ok = await engine.send_command(
+                        device_key, h["accion_fin_codigo"]
+                    )
+                    estado = "FINALIZADA" if ok else "ERROR_FINALIZACION"
                 else:
-                    print(f"  [SKIP FIN] {device_key} no tiene inicio activo")
+                    logger.warning("%s: sin IP WiFi, omitiendo", device_key)
+                    estado = "ERROR_FINALIZACION"
+                await http.finalize_task_history(htd_id, estado)
+                await http.update_schedule_last_execution(horario_id)
+                logger.info(
+                    "[FIN] %s -> %s (%s)", device_key, h["accion_fin_codigo"], estado
+                )
+            else:
+                logger.debug(
+                    "[SKIP FIN] %s no tiene inicio activo", device_key
+                )
 
-        conn.commit()
+
+async def scheduler_loop(engine):
+    logger.info("Scheduler iniciado (intervalo: %ds)", INTERVALO_SCHEDULER)
+    while True:
+        try:
+            await revisar_horarios(engine)
+        except Exception as e:
+            logger.error("Error en scheduler: %s", e, exc_info=True)
+        await asyncio.sleep(INTERVALO_SCHEDULER)
 
 
-def _actualizar_ultima_ejecucion(cursor, horario_tarea_id):
-    cursor.execute(
-        """
-        UPDATE horario_tarea
-        SET ultima_ejecucion = NOW()
-        WHERE horario_tarea_id = %s
-        """,
-        (horario_tarea_id,),
+async def registry_refresh_loop(engine):
+    logger.info(
+        "Registry refresh loop iniciado (intervalo: %ds)", INTERVALO_REGISTRY_REFRESH
     )
+    while True:
+        await asyncio.sleep(INTERVALO_REGISTRY_REFRESH)
+        try:
+            await engine.refresh_registry()
+        except Exception as e:
+            logger.error("Error refrescando registry: %s", e, exc_info=True)
+
+
+async def revisar_offline(engine):
+    http: HttpClient = engine.http
+
+    offlines = await http.get_offline_devices(TIMEOUT_OFFLINE)
+    for d in offlines:
+        await http.create_incident(
+            "DEVICE_OFFLINE",
+            d["dispositivo_id"],
+            d["device_key"],
+            f"Sin comunicación desde {d.get('ultima_comunicacion', '?')}",
+        )
+        logger.warning("OFFLINE: %s (%s)", d["device_key"], d.get("nombre"))
+
+    recuperados = await http.get_recovered_devices(TIMEOUT_OFFLINE)
+    for d in recuperados:
+        await http.resolve_incidents(d["device_key"], "DEVICE_OFFLINE")
+        await http.create_incident(
+            "RECUPERACION_ONLINE",
+            d["dispositivo_id"],
+            d["device_key"],
+            "Dispositivo volvió a comunicar",
+        )
+        logger.info("RECUPERADO: %s", d["device_key"])
+
+
+async def offline_check_loop(engine):
+    logger.info(
+        "Offline check loop iniciado (intervalo: %ds, timeout: %dmin)",
+        INTERVALO_OFFLINE,
+        TIMEOUT_OFFLINE,
+    )
+    while True:
+        await asyncio.sleep(INTERVALO_OFFLINE)
+        try:
+            await revisar_offline(engine)
+        except Exception as e:
+            logger.error("Error en offline check: %s", e, exc_info=True)
